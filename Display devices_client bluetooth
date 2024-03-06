@@ -1,0 +1,181 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <SwitecX25.h>
+#include <queue>
+
+#define FILTER_SIZE 5
+std::queue<int> distanceQueue;
+int sumOfDistances = 0;
+
+void addDistanceToFilter(int distance) {
+    if(distanceQueue.size() >= FILTER_SIZE) {
+        sumOfDistances -= distanceQueue.front();
+        distanceQueue.pop();
+    }
+    distanceQueue.push(distance);
+    sumOfDistances += distance;
+}
+
+int getFilteredDistance() {
+    if(distanceQueue.empty()) return -1;
+    return sumOfDistances / distanceQueue.size();
+}
+
+// The remote service and characteristic we wish to connect to.
+static BLEUUID serviceUUID("ed9220fa-e564-4afc-8d92-0f8f3e1999a6");
+static BLEUUID charUUID("a1bd36d3-f257-4934-907a-a7943b002a09");
+
+static boolean doConnect = false;
+static boolean connected = false;
+static boolean doScan = false;
+static BLERemoteCharacteristic* pRemoteCharacteristic;
+static BLEAdvertisedDevice* myDevice;
+
+// Motor and buzzer setup
+#define STEPS 315 * 3 // 315 degrees, 3 steps per degree
+SwitecX25 motor(STEPS, D0, D1, D3, D2); // Initialize the motor
+#define BUZZER_PIN D9
+int receivedDistance = -1;
+
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) {
+  }
+
+  void onDisconnect(BLEClient* pclient) {
+    connected = false;
+    Serial.println("onDisconnect");
+  }
+};
+
+static void notifyCallback(
+  BLERemoteCharacteristic* pBLERemoteCharacteristic,
+  uint8_t* pData,
+  size_t length,
+  bool isNotify) {
+    if (length > 0) {
+        String distanceStr = "";
+        for (int i = 0; i < length; i++) {
+            distanceStr += (char)pData[i];
+        }
+        receivedDistance = distanceStr.toInt();
+        Serial.println("Received distance: " + String(receivedDistance) + " cm");
+    }
+}
+
+bool connectToServer() {
+    Serial.print("Forming a connection to ");
+    Serial.println(myDevice->getAddress().toString().c_str());
+
+    BLEClient* pClient = BLEDevice::createClient();
+    Serial.println(" - Created client");
+
+    pClient->setClientCallbacks(new MyClientCallback());
+
+    pClient->connect(myDevice);
+    Serial.println(" - Connected to server");
+    pClient->setMTU(517);
+
+    BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
+    if (pRemoteService == nullptr) {
+      Serial.print("Failed to find our service UUID: ");
+      Serial.println(serviceUUID.toString().c_str());
+      pClient->disconnect();
+      return false;
+    }
+    Serial.println(" - Found our service");
+
+    pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
+    if (pRemoteCharacteristic == nullptr) {
+      Serial.print("Failed to find our characteristic UUID: ");
+      Serial.println(charUUID.toString().c_str());
+      pClient->disconnect();
+      return false;
+    }
+    Serial.println(" - Found our characteristic");
+
+    if(pRemoteCharacteristic->canNotify())
+      pRemoteCharacteristic->registerForNotify(notifyCallback);
+
+    connected = true;
+    return true;
+}
+
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    Serial.print("BLE Advertised Device found: ");
+    Serial.println(advertisedDevice.toString().c_str());
+
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
+      BLEDevice::getScan()->stop();
+      myDevice = new BLEAdvertisedDevice(advertisedDevice);
+      doConnect = true;
+      doScan = false;
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting Arduino BLE Client application...");
+  BLEDevice::init("");
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW); // Ensure buzzer is off initially
+
+  // Initialize motor position
+  motor.zero();
+  while (motor.currentStep != 0) {
+    motor.update();
+    delay(1);
+  }
+
+  BLEScan* pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setInterval(1349);
+  pBLEScan->setWindow(449);
+  pBLEScan->setActiveScan(true);
+  pBLEScan->start(5, false);
+}
+
+
+void loop() {
+  if (doConnect == true) {
+    if (connectToServer()) {
+      Serial.println("We are now connected to the BLE Server.");
+    } else {
+      Serial.println("We have failed to connect to the server.");
+    }
+    doConnect = false;
+  }
+
+  if (receivedDistance >= 0) {
+    addDistanceToFilter(receivedDistance);
+    int filteredDistance = getFilteredDistance();
+  
+    int motorPosition = 0;
+    if (receivedDistance <= 300 && receivedDistance > 200) {
+      motorPosition = STEPS / 4; // 90 degrees
+    } else if (receivedDistance <= 200 && receivedDistance > 100) {
+      motorPosition = STEPS / 2; // 180 degrees
+    } else if (receivedDistance <= 100) {
+      motorPosition = STEPS * 3 / 4; // 270 degrees
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(100);
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+    motor.setPosition(motorPosition);
+    while (motor.currentStep != motor.targetStep) {
+      motor.update();
+    }
+    receivedDistance = -1; // Reset received distance
+  }
+
+  if (doScan) {
+    BLEDevice::getScan()->start(0, false);
+  }
+
+  delay(1000); // Delay a second between loops.
+}
